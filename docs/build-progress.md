@@ -139,3 +139,4 @@ Short plain-English log of major foundation steps.
 - Added workflow: `/.github/workflows/api-smoke.yml`.
 - CI starts API server, waits on health, then runs smoke suite.
 - Added setup doc for required repository secrets: `/docs/ci-smoke-setup.md`.
+- Improved smoke diagnostics for agent-list failure (prints API response on fail).

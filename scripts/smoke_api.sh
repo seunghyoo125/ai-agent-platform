@@ -21,7 +21,12 @@ echo "[1/7] Health"
 curl -s "${BASE_URL}/health" | jq -e '.ok == true' >/dev/null
 
 echo "[2/7] Agent list"
-curl -s "${BASE_URL}/api/agents?org_id=${ORG_ID}" -H "${auth_header}" | jq -e '.ok == true and (.data.count >= 1)' >/dev/null
+agents_resp="$(curl -s "${BASE_URL}/api/agents?org_id=${ORG_ID}" -H "${auth_header}")"
+if ! echo "${agents_resp}" | jq -e '.ok == true and (.data.count >= 1)' >/dev/null; then
+  echo "Agent list check failed. Response:"
+  echo "${agents_resp}" | jq .
+  exit 1
+fi
 
 echo "[3/7] Create eval run"
 run_payload="$(jq -n \
