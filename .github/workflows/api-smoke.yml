@@ -1,0 +1,50 @@
+name: API Smoke
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      BASE_URL: http://127.0.0.1:8001
+      API_KEY: ${{ secrets.SMOKE_API_KEY }}
+      ORG_ID: ${{ secrets.SMOKE_ORG_ID }}
+      AGENT_ID: ${{ secrets.SMOKE_AGENT_ID }}
+      GOLDEN_SET_ID: ${{ secrets.SMOKE_GOLDEN_SET_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start API server
+        run: |
+          nohup uvicorn src.api.main:app --host 127.0.0.1 --port 8001 > uvicorn.log 2>&1 &
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8001/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to start"
+          cat uvicorn.log || true
+          exit 1
+
+      - name: Run smoke suite
+        run: ./scripts/smoke_api.sh
+
+      - name: Dump API logs on failure
+        if: failure()
+        run: cat uvicorn.log || true
