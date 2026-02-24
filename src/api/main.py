@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
@@ -13,6 +14,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from src.api.db import get_conn
+from src.api.services.judge import (
+    JudgeConfigurationError,
+    ProviderJudgeNotReadyError,
+    ProviderJudgeRuntimeError,
+    compute_agreement,
+    get_judge_service,
+)
 
 RunType = Literal["eval", "regression", "ab_comparison", "calibration"]
 RunStatus = Literal["pending", "running", "completed", "failed"]
@@ -91,79 +99,6 @@ def _validate_db_api_key(token: str) -> bool:
                 return True
     except Exception:
         return False
-
-
-def _generate_answer_response(input_text: str, expected_output: Optional[str], acceptable_sources: Optional[str]) -> str:
-    base = (expected_output or "").strip()
-    if not base:
-        base = f"Draft response for: {input_text}"
-    if acceptable_sources and acceptable_sources.strip():
-        return f"{base} Source: {acceptable_sources.strip()}."
-    return base
-
-
-def _score_answer_case(
-    expected_output: Optional[str],
-    acceptable_sources: Optional[str],
-    generated: str,
-) -> Dict[str, str]:
-    generated_lower = generated.lower()
-    expected = (expected_output or "").strip()
-    source_hint = (acceptable_sources or "").strip()
-
-    if expected:
-        if expected.lower() in generated_lower:
-            answer_correct = "yes"
-        elif any(tok in generated_lower for tok in expected.lower().split()[:3]):
-            answer_correct = "partially"
-        else:
-            answer_correct = "no"
-    else:
-        answer_correct = "partially"
-
-    if source_hint:
-        if source_hint.lower() in generated_lower and "source" in generated_lower:
-            source_correct = "yes"
-        elif "source" in generated_lower:
-            source_correct = "partially"
-        else:
-            source_correct = "no"
-    else:
-        source_correct = "partially"
-
-    text_len = len(generated.strip())
-    if text_len == 0:
-        response_quality = "not_good"
-    elif text_len < 40:
-        response_quality = "average"
-    else:
-        response_quality = "good"
-
-    return {
-        "answer_correct": answer_correct,
-        "source_correct": source_correct,
-        "response_quality": response_quality,
-    }
-
-
-def _criteria_payload(criteria: Any) -> Dict[str, Any]:
-    # Normalize criteria into deterministic result and dimension maps.
-    items: List[Dict[str, Any]] = []
-    if isinstance(criteria, list):
-        for idx, c in enumerate(criteria):
-            if isinstance(c, dict):
-                cid = str(c.get("id") or c.get("criterionId") or f"criterion_{idx + 1}")
-            else:
-                cid = f"criterion_{idx + 1}"
-            items.append({"criterionId": cid, "score": "good", "evidence": "System baseline execution."})
-    elif isinstance(criteria, dict):
-        for key in criteria.keys():
-            items.append({"criterionId": str(key), "score": "good", "evidence": "System baseline execution."})
-    else:
-        items.append({"criterionId": "criterion_1", "score": "good", "evidence": "System baseline execution."})
-
-    dimension_scores = {item["criterionId"]: item["score"] for item in items}
-    return {"criteria_results": items, "dimension_scores": dimension_scores, "overall_score": "good"}
 
 
 def require_api_key(authorization: Optional[str] = Header(default=None)) -> str:
@@ -278,6 +213,34 @@ class EvalRunSummaryData(BaseModel):
     quality_good_rate: float
     created_at: datetime
     completed_at: Optional[datetime]
+
+
+class CalibrationCaseComparison(BaseModel):
+    case_id: Optional[UUID] = None
+    human_label: str = Field(min_length=1)
+    judge_label: str = Field(min_length=1)
+    is_clean: bool = False
+    notes: Optional[str] = None
+
+
+class CalibrationRunCreateRequest(BaseModel):
+    org_id: UUID
+    agent_id: UUID
+    prompt_version: str = Field(min_length=1, max_length=255)
+    judge_model: str = Field(min_length=1, max_length=255)
+    per_case_comparison: List[CalibrationCaseComparison] = Field(min_length=1)
+
+
+class CalibrationRunData(BaseModel):
+    id: UUID
+    org_id: UUID
+    agent_id: UUID
+    prompt_version: str
+    judge_model: str
+    overall_agreement: float
+    clean_agreement: Optional[float]
+    per_case_comparison: List[Dict[str, Any]]
+    created_at: datetime
 
 
 class EvalRunExecuteData(BaseModel):
@@ -411,6 +374,17 @@ class ApiKeyCreateRequest(BaseModel):
     expires_at: Optional[datetime] = None
 
 
+class ApiKeyListItem(BaseModel):
+    id: UUID
+    org_id: Optional[UUID]
+    name: str
+    key_prefix: str
+    status: str
+    expires_at: Optional[datetime]
+    last_used_at: Optional[datetime]
+    created_at: datetime
+
+
 class GoldenSetCaseUpload(BaseModel):
     input: str = Field(min_length=1)
     expected_output: Optional[str] = None
@@ -521,6 +495,78 @@ def create_api_key(
     }
 
 
+@app.get("/api/system/api-keys")
+def list_api_keys(
+    status_filter: Optional[Literal["active", "revoked"]] = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    _: str = Depends(require_api_key),
+) -> Dict[str, Any]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            where = []
+            params: List[Any] = []
+            if status_filter is not None:
+                where.append("status::text = %s")
+                params.append(status_filter)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+
+            cur.execute(
+                f"""
+                select
+                  id,
+                  org_id,
+                  name,
+                  key_prefix,
+                  status::text,
+                  expires_at,
+                  last_used_at,
+                  created_at
+                from public.api_keys
+                {where_sql}
+                order by created_at desc
+                limit %s
+                offset %s
+                """,
+                (*params, limit, offset),
+            )
+            rows = cur.fetchall()
+
+            cur.execute(
+                f"""
+                select count(1)
+                from public.api_keys
+                {where_sql}
+                """,
+                tuple(params),
+            )
+            total_count = int(cur.fetchone()[0])  # type: ignore[index]
+
+    items = [
+        ApiKeyListItem(
+            id=r[0],
+            org_id=r[1],
+            name=r[2],
+            key_prefix=r[3],
+            status=r[4],
+            expires_at=r[5],
+            last_used_at=r[6],
+            created_at=r[7],
+        ).model_dump(mode="json")
+        for r in rows
+    ]
+    return {
+        "ok": True,
+        "data": {
+            "items": items,
+            "count": len(items),
+            "total_count": total_count,
+            "limit": limit,
+            "offset": offset,
+        },
+    }
+
+
 @app.post("/api/system/api-keys/{key_id}/revoke")
 def revoke_api_key(
     key_id: UUID = Path(...),
@@ -595,17 +641,172 @@ def create_eval_run(
     return {"ok": True, "data": data.model_dump(mode="json")}
 
 
-@app.post("/api/eval/runs/{run_id}/execute")
-def execute_eval_run(
-    run_id: UUID = Path(...),
+@app.post("/api/calibration/runs", status_code=status.HTTP_201_CREATED)
+def create_calibration_run(
+    payload: CalibrationRunCreateRequest = Body(
+        ...,
+        examples=[
+            {
+                "name": "create-calibration",
+                "summary": "Create calibration run from human vs judge comparisons",
+                "value": {
+                    "org_id": "23cdb862-a12f-4b6c-84ee-5cb648f9b5bb",
+                    "agent_id": "e3660b25-47cf-47f3-ab53-c080fb7ffdcc",
+                    "prompt_version": "judge_prompt_v1",
+                    "judge_model": "gpt-4.1-mini",
+                    "per_case_comparison": [
+                        {"case_id": None, "human_label": "yes", "judge_label": "yes", "is_clean": True},
+                        {"case_id": None, "human_label": "partially", "judge_label": "no", "is_clean": False},
+                    ],
+                },
+            }
+        ],
+    ),
     _: str = Depends(require_api_key),
 ) -> Dict[str, Any]:
+    cases_json = [c.model_dump(mode="json") for c in payload.per_case_comparison]
+    overall_agreement, clean_agreement = compute_agreement(cases_json)
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    select id, org_id, agent_id, golden_set_id, status::text
+                    insert into public.calibration_runs (
+                        org_id,
+                        agent_id,
+                        prompt_version,
+                        judge_model,
+                        overall_agreement,
+                        clean_agreement,
+                        per_case_comparison
+                    )
+                    values (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                    returning
+                        id, org_id, agent_id, prompt_version, judge_model,
+                        overall_agreement, clean_agreement, per_case_comparison, created_at
+                    """,
+                    (
+                        str(payload.org_id),
+                        str(payload.agent_id),
+                        payload.prompt_version,
+                        payload.judge_model,
+                        overall_agreement,
+                        clean_agreement,
+                        json.dumps(cases_json),
+                    ),
+                )
+                row = cur.fetchone()
+    except Exception as exc:
+        _error("CALIBRATION_CREATE_FAILED", f"Failed to create calibration run: {exc}", status.HTTP_400_BAD_REQUEST)
+
+    data = CalibrationRunData(
+        id=row[0],  # type: ignore[index]
+        org_id=row[1],  # type: ignore[index]
+        agent_id=row[2],  # type: ignore[index]
+        prompt_version=row[3],  # type: ignore[index]
+        judge_model=row[4],  # type: ignore[index]
+        overall_agreement=float(row[5]),  # type: ignore[index]
+        clean_agreement=float(row[6]) if row[6] is not None else None,  # type: ignore[index]
+        per_case_comparison=row[7] or [],  # type: ignore[index]
+        created_at=row[8],  # type: ignore[index]
+    )
+    return {"ok": True, "data": data.model_dump(mode="json")}
+
+
+@app.get("/api/calibration/runs/{calibration_id}")
+def get_calibration_run(
+    calibration_id: UUID = Path(...),
+    _: str = Depends(require_api_key),
+) -> Dict[str, Any]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                    id, org_id, agent_id, prompt_version, judge_model,
+                    overall_agreement, clean_agreement, per_case_comparison, created_at
+                from public.calibration_runs
+                where id = %s
+                """,
+                (str(calibration_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                _error(
+                    "CALIBRATION_NOT_FOUND",
+                    f"Calibration run {calibration_id} was not found.",
+                    status.HTTP_404_NOT_FOUND,
+                )
+
+    data = CalibrationRunData(
+        id=row[0],  # type: ignore[index]
+        org_id=row[1],  # type: ignore[index]
+        agent_id=row[2],  # type: ignore[index]
+        prompt_version=row[3],  # type: ignore[index]
+        judge_model=row[4],  # type: ignore[index]
+        overall_agreement=float(row[5]),  # type: ignore[index]
+        clean_agreement=float(row[6]) if row[6] is not None else None,  # type: ignore[index]
+        per_case_comparison=row[7] or [],  # type: ignore[index]
+        created_at=row[8],  # type: ignore[index]
+    )
+    return {"ok": True, "data": data.model_dump(mode="json")}
+
+
+@app.get("/api/agents/{agent_id}/calibration/latest")
+def get_agent_latest_calibration(
+    agent_id: UUID = Path(...),
+    _: str = Depends(require_api_key),
+) -> Dict[str, Any]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("select id from public.agents where id = %s", (str(agent_id),))
+            if not cur.fetchone():
+                _error("AGENT_NOT_FOUND", f"Agent {agent_id} was not found.", status.HTTP_404_NOT_FOUND)
+
+            cur.execute(
+                """
+                select
+                    id, org_id, agent_id, prompt_version, judge_model,
+                    overall_agreement, clean_agreement, per_case_comparison, created_at
+                from public.calibration_runs
+                where agent_id = %s
+                order by created_at desc
+                limit 1
+                """,
+                (str(agent_id),),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return {"ok": True, "data": {"agent_id": str(agent_id), "latest_calibration": None}}
+
+    latest = CalibrationRunData(
+        id=row[0],  # type: ignore[index]
+        org_id=row[1],  # type: ignore[index]
+        agent_id=row[2],  # type: ignore[index]
+        prompt_version=row[3],  # type: ignore[index]
+        judge_model=row[4],  # type: ignore[index]
+        overall_agreement=float(row[5]),  # type: ignore[index]
+        clean_agreement=float(row[6]) if row[6] is not None else None,  # type: ignore[index]
+        per_case_comparison=row[7] or [],  # type: ignore[index]
+        created_at=row[8],  # type: ignore[index]
+    )
+    return {"ok": True, "data": {"agent_id": str(agent_id), "latest_calibration": latest.model_dump(mode="json")}}
+
+
+@app.post("/api/eval/runs/{run_id}/execute")
+def execute_eval_run(
+    run_id: UUID = Path(...),
+    _: str = Depends(require_api_key),
+) -> Dict[str, Any]:
+    exec_start = time.perf_counter()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select id, org_id, agent_id, golden_set_id, status::text, config
                     from public.eval_runs
                     where id = %s
                     for update
@@ -619,6 +820,15 @@ def execute_eval_run(
                 agent_id = run_row[2]  # type: ignore[index]
                 golden_set_id = run_row[3]  # type: ignore[index]
                 run_status = run_row[4]  # type: ignore[index]
+                run_config = run_row[5] or {}  # type: ignore[index]
+                judge_mode = str(run_config.get("judge_mode", "deterministic"))
+                judge_model = run_config.get("judge_model")
+                judge_prompt_version = run_config.get("judge_prompt_version")
+                judge = get_judge_service(
+                    mode=judge_mode,
+                    prompt_version=judge_prompt_version,
+                    model=judge_model,
+                )
 
                 if golden_set_id is None:
                     _error(
@@ -663,6 +873,7 @@ def execute_eval_run(
                 now_date = datetime.now(timezone.utc).date()
 
                 for case in cases:
+                    case_start = time.perf_counter()
                     case_id = case[0]
                     input_text = case[1] or ""
                     expected_output = case[2]
@@ -671,8 +882,14 @@ def execute_eval_run(
                     eval_criteria = case[5]
 
                     if eval_mode == "answer":
-                        generated = _generate_answer_response(input_text, expected_output, acceptable_sources)
-                        score = _score_answer_case(expected_output, acceptable_sources, generated)
+                        score = judge.evaluate_answer_case(input_text, expected_output, acceptable_sources)
+                        trace_notes = {
+                            "trace_version": "v1",
+                            "judge_mode": judge_mode,
+                            "judge_model": judge_model,
+                            "judge_prompt_version": judge_prompt_version,
+                            "case_latency_ms": round((time.perf_counter() - case_start) * 1000, 2),
+                        }
                         cur.execute(
                             """
                             insert into public.eval_results (
@@ -709,7 +926,7 @@ def execute_eval_run(
                                 str(run_id),
                                 str(case_id),
                                 str(agent_id),
-                                generated,
+                                score["generated"],
                                 acceptable_sources,
                                 score["answer_correct"],
                                 [],
@@ -717,17 +934,23 @@ def execute_eval_run(
                                 [],
                                 score["response_quality"],
                                 [],
-                                "Deterministic baseline execution.",
+                                score["reasoning"],
                                 "system",
                                 "default",
                                 now_date,
-                                None,
+                                json.dumps(trace_notes),
                                 str(case_id),
                             ),
                         )
                     else:
-                        payload = _criteria_payload(eval_criteria)
-                        generated = f"Criteria-evaluated response for: {input_text}"
+                        criteria_eval = judge.evaluate_criteria_case(input_text, eval_criteria)
+                        trace_notes = {
+                            "trace_version": "v1",
+                            "judge_mode": judge_mode,
+                            "judge_model": judge_model,
+                            "judge_prompt_version": judge_prompt_version,
+                            "case_latency_ms": round((time.perf_counter() - case_start) * 1000, 2),
+                        }
                         cur.execute(
                             """
                             insert into public.eval_results (
@@ -758,32 +981,95 @@ def execute_eval_run(
                                 str(run_id),
                                 str(case_id),
                                 str(agent_id),
-                                generated,
-                                json.dumps(payload["criteria_results"]),
-                                json.dumps(payload["dimension_scores"]),
-                                payload["overall_score"],
-                                "Deterministic baseline execution.",
+                                criteria_eval["generated"],
+                                json.dumps(criteria_eval["criteria_results"]),
+                                json.dumps(criteria_eval["dimension_scores"]),
+                                criteria_eval["overall_score"],
+                                criteria_eval["reasoning"],
                                 "system",
                                 "default",
                                 now_date,
-                                None,
+                                json.dumps(trace_notes),
                                 str(case_id),
                             ),
                         )
 
+                exec_summary = {
+                    "execution": {
+                        "trace_version": "v1",
+                        "judge_mode": judge_mode,
+                        "judge_model": judge_model,
+                        "judge_prompt_version": judge_prompt_version,
+                        "case_count": len(cases),
+                        "duration_ms": round((time.perf_counter() - exec_start) * 1000, 2),
+                        "executed_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                }
                 cur.execute(
                     """
                     update public.eval_runs
                     set status = 'completed',
                         completed_at = now(),
+                        design_context = coalesce(design_context, '{}'::jsonb) || %s::jsonb,
                         failure_reason = null
                     where id = %s
                     returning completed_at
                     """,
-                    (str(run_id),),
+                    (json.dumps(exec_summary), str(run_id)),
                 )
                 completed_at = cur.fetchone()[0]  # type: ignore[index]
 
+    except JudgeConfigurationError as exc:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        update public.eval_runs
+                        set status = 'failed',
+                            completed_at = now(),
+                            failure_reason = %s
+                        where id = %s
+                        """,
+                        (str(exc), str(run_id)),
+                    )
+        except Exception:
+            pass
+        _error("EVAL_JUDGE_CONFIG_ERROR", str(exc), status.HTTP_400_BAD_REQUEST)
+    except ProviderJudgeNotReadyError as exc:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        update public.eval_runs
+                        set status = 'failed',
+                            completed_at = now(),
+                            failure_reason = %s
+                        where id = %s
+                        """,
+                        (str(exc), str(run_id)),
+                    )
+        except Exception:
+            pass
+        _error("EVAL_JUDGE_NOT_READY", str(exc), status.HTTP_501_NOT_IMPLEMENTED)
+    except ProviderJudgeRuntimeError as exc:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        update public.eval_runs
+                        set status = 'failed',
+                            completed_at = now(),
+                            failure_reason = %s
+                        where id = %s
+                        """,
+                        (str(exc), str(run_id)),
+                    )
+        except Exception:
+            pass
+        _error("EVAL_JUDGE_PROVIDER_ERROR", str(exc), status.HTTP_502_BAD_GATEWAY)
     except HTTPException:
         raise
     except Exception as exc:

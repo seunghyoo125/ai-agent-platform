@@ -31,6 +31,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Run unit tests
+        run: python3 -m pytest -q tests
+
       - name: Start API server
         run: |
           nohup uvicorn src.api.main:app --host 127.0.0.1 --port 8001 > uvicorn.log 2>&1 &

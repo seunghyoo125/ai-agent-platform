@@ -86,6 +86,16 @@ Success:
 }
 ```
 
+## GET `/api/system/api-keys`
+
+Lists API keys (metadata only; no plaintext or hash).
+
+Query params:
+
+- `status` (optional): `active|revoked`
+- `limit` (optional, default `50`, max `200`)
+- `offset` (optional, default `0`)
+
 ## POST `/api/system/api-keys/{key_id}/revoke`
 
 Revokes an API key by ID.
@@ -147,6 +157,20 @@ Success:
 Errors:
 - `EVAL_RUN_NO_GOLDEN_SET` if run has no attached golden set.
 - `EVAL_RUN_ALREADY_RUNNING` if run is currently running.
+- `EVAL_JUDGE_CONFIG_ERROR` if `judge_mode=provider` is misconfigured (e.g. missing provider env vars).
+- `EVAL_JUDGE_NOT_READY` if provider mode is selected but provider execution is not yet implemented.
+- `EVAL_JUDGE_PROVIDER_ERROR` if provider call/parsing fails during execution.
+
+Run config note:
+- `judge_mode` in run `config` can be `deterministic` (default) or `provider`.
+- Optional provider fields in run `config`:
+  - `judge_model` (example: `gpt-4.1-mini`)
+  - `judge_prompt_version` (metadata only)
+
+Provider env vars:
+- `JUDGE_PROVIDER` (currently `openai`)
+- `OPENAI_API_KEY`
+- `OPENAI_API_BASE` (optional override; defaults to `https://api.openai.com/v1`)
 
 Success:
 
@@ -294,6 +318,47 @@ Success:
     "quality_good_rate": 0.0,
     "created_at": "2026-02-23T08:00:00Z",
     "completed_at": null
+  }
+}
+```
+
+## POST `/api/calibration/runs`
+
+Creates a calibration run and computes agreement metrics server-side.
+
+Status: `201`
+
+Request:
+
+```json
+{
+  "org_id": "uuid",
+  "agent_id": "uuid",
+  "prompt_version": "judge_prompt_v1",
+  "judge_model": "gpt-4.1-mini",
+  "per_case_comparison": [
+    { "case_id": null, "human_label": "yes", "judge_label": "yes", "is_clean": true },
+    { "case_id": null, "human_label": "partially", "judge_label": "no", "is_clean": false }
+  ]
+}
+```
+
+## GET `/api/calibration/runs/{calibration_id}`
+
+Fetches one calibration run by ID.
+
+## GET `/api/agents/{agent_id}/calibration/latest`
+
+Fetches latest calibration run for an agent.
+
+If none exists:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "agent_id": "uuid",
+    "latest_calibration": null
   }
 }
 ```

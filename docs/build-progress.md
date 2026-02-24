@@ -140,3 +140,49 @@ Short plain-English log of major foundation steps.
 - CI starts API server, waits on health, then runs smoke suite.
 - Added setup doc for required repository secrets: `/docs/ci-smoke-setup.md`.
 - Improved smoke diagnostics for agent-list failure (prints API response on fail).
+
+### Step 21: Calibration APIs
+- Added `POST /api/calibration/runs` with server-computed agreement metrics.
+- Added `GET /api/calibration/runs/{id}`.
+- Added `GET /api/agents/{agent_id}/calibration/latest`.
+- Supports storing per-case human vs judge comparisons in `calibration_runs`.
+
+### Step 22: Pluggable Judge Service Layer
+- Added service module: `/src/api/services/judge.py`.
+- Moved eval scoring and calibration agreement math out of API route file.
+- `execute` and calibration endpoints now call service-layer functions.
+- Established clean path for future provider-backed judge/generation without endpoint redesign.
+
+### Step 23: Provider Judge Scaffold + Error Contracts
+- Added `judge_mode=provider` scaffold with env validation checks.
+- Introduced typed judge errors:
+  - configuration errors -> `EVAL_JUDGE_CONFIG_ERROR`
+  - not-implemented provider path -> `EVAL_JUDGE_NOT_READY`
+- Kept deterministic mode as default, stable execution path.
+
+### Step 24: OpenAI Provider Judge Implementation (v1)
+- Implemented OpenAI-backed provider path in judge service for:
+  - answer-mode scoring
+  - criteria-mode scoring
+- Added JSON response parsing and provider runtime error mapping.
+- Added `EVAL_JUDGE_PROVIDER_ERROR` API contract for provider execution failures.
+
+### Step 25: API Key Visibility Endpoint
+- Added `GET /api/system/api-keys` for key status/debugging.
+- Returns key metadata only (id/prefix/status/expiry/last-used), no hash/plaintext.
+- Added optional status filter and pagination.
+
+### Step 26: Execution Observability Traces
+- Added per-case execution trace metadata in `eval_results.notes` (JSON string):
+  - judge mode/model/prompt version
+  - per-case latency (ms)
+- Added run-level execution summary merge into `eval_runs.design_context`:
+  - case count
+  - total duration (ms)
+  - execution timestamp
+
+### Step 27: Judge Service Unit Tests + CI Gate
+- Added unit tests for judge service and agreement math:
+  - `/tests/test_judge_service.py`
+- Added `pytest` to dependencies.
+- Updated CI workflow to run unit tests before smoke suite.
