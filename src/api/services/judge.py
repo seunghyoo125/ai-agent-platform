@@ -90,6 +90,55 @@ class JudgeService:
             "reasoning": f"{self.context.mode} baseline execution.",
         }
 
+    def score_answer_case(
+        self,
+        input_text: str,
+        expected_output: Optional[str],
+        acceptable_sources: Optional[str],
+        actual_response: Optional[str],
+        actual_sources: Optional[str],
+    ) -> Dict[str, Any]:
+        del input_text
+        expected = (expected_output or "").strip().lower()
+        actual = (actual_response or "").strip().lower()
+        expected_sources = (acceptable_sources or "").strip().lower()
+        actual_src = (actual_sources or "").strip().lower()
+
+        if expected:
+            if expected in actual:
+                answer_correct = "yes"
+            elif any(tok in actual for tok in expected.split()[:3]):
+                answer_correct = "partially"
+            else:
+                answer_correct = "no"
+        else:
+            answer_correct = "partially"
+
+        if expected_sources:
+            if expected_sources in actual_src or expected_sources in actual:
+                source_correct = "yes"
+            elif actual_src or "source" in actual:
+                source_correct = "partially"
+            else:
+                source_correct = "no"
+        else:
+            source_correct = "partially"
+
+        text_len = len((actual_response or "").strip())
+        if text_len == 0:
+            response_quality = "not_good"
+        elif text_len < 40:
+            response_quality = "average"
+        else:
+            response_quality = "good"
+
+        return {
+            "answer_correct": answer_correct,
+            "source_correct": source_correct,
+            "response_quality": response_quality,
+            "reasoning": f"{self.context.mode} deterministic scoring on actual response.",
+        }
+
     def evaluate_criteria_case(self, input_text: str, criteria: Any) -> Dict[str, Any]:
         items: List[Dict[str, Any]] = []
         if isinstance(criteria, list):
@@ -112,6 +161,38 @@ class JudgeService:
             "dimension_scores": dimension_scores,
             "overall_score": "good",
             "reasoning": f"{self.context.mode} baseline execution.",
+        }
+
+    def score_criteria_case(
+        self,
+        input_text: str,
+        criteria: Any,
+        actual_response: Optional[str],
+    ) -> Dict[str, Any]:
+        del input_text
+        items: List[Dict[str, Any]] = []
+        response_text = (actual_response or "").strip()
+        default_score = "good" if len(response_text) >= 40 else "average"
+        if isinstance(criteria, list):
+            for idx, c in enumerate(criteria):
+                if isinstance(c, dict):
+                    cid = str(c.get("id") or c.get("criterionId") or f"criterion_{idx + 1}")
+                else:
+                    cid = f"criterion_{idx + 1}"
+                items.append({"criterionId": cid, "score": default_score, "evidence": "Deterministic scoring."})
+        elif isinstance(criteria, dict):
+            for key in criteria.keys():
+                items.append({"criterionId": str(key), "score": default_score, "evidence": "Deterministic scoring."})
+        else:
+            items.append({"criterionId": "criterion_1", "score": default_score, "evidence": "Deterministic scoring."})
+
+        dimension_scores = {item["criterionId"]: item["score"] for item in items}
+        overall_score = "good" if all(x["score"] == "good" for x in items) else "average"
+        return {
+            "criteria_results": items,
+            "dimension_scores": dimension_scores,
+            "overall_score": overall_score,
+            "reasoning": f"{self.context.mode} deterministic criteria scoring on actual response.",
         }
 
 
@@ -167,6 +248,12 @@ class ProviderJudgeService(JudgeService):
             data = json.loads(content)
             if not isinstance(data, dict):
                 raise ValueError("JSON response is not an object.")
+            data["_provider_meta"] = {
+                "provider": "openai",
+                "model": body.get("model"),
+                "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
+                "response_id": body.get("id"),
+            }
             return data
         except Exception as exc:
             raise ProviderJudgeRuntimeError(f"Failed to parse OpenAI JSON response: {exc}") from exc
@@ -201,6 +288,43 @@ class ProviderJudgeService(JudgeService):
             "source_correct": str(data.get("source_correct", "partially")),
             "response_quality": str(data.get("response_quality", "average")),
             "reasoning": str(data.get("reasoning", "Provider judge execution.")),
+            "_provider_meta": data.get("_provider_meta") if isinstance(data.get("_provider_meta"), dict) else {},
+        }
+
+    def score_answer_case(
+        self,
+        input_text: str,
+        expected_output: Optional[str],
+        acceptable_sources: Optional[str],
+        actual_response: Optional[str],
+        actual_sources: Optional[str],
+    ) -> Dict[str, Any]:
+        if self.provider != "openai":
+            raise ProviderJudgeNotReadyError(
+                f"Provider judge mode is configured ({self.provider}) but only openai is currently implemented."
+            )
+        system_prompt = (
+            "You are an evaluation judge. Return strict JSON with keys: "
+            "answer_correct, source_correct, response_quality, reasoning. "
+            "Allowed values: answer_correct/source_correct in [yes, partially, no], "
+            "response_quality in [good, average, not_good]. "
+            "Score the ACTUAL response, do not generate a new answer."
+        )
+        user_prompt = (
+            f"Input:\n{input_text}\n\n"
+            f"Expected output:\n{(expected_output or '').strip()}\n\n"
+            f"Acceptable sources:\n{(acceptable_sources or '').strip()}\n\n"
+            f"Actual response:\n{(actual_response or '').strip()}\n\n"
+            f"Actual sources:\n{(actual_sources or '').strip()}\n\n"
+            "Score only."
+        )
+        data = self._openai_json_judge(system_prompt, user_prompt)
+        return {
+            "answer_correct": str(data.get("answer_correct", "partially")),
+            "source_correct": str(data.get("source_correct", "partially")),
+            "response_quality": str(data.get("response_quality", "average")),
+            "reasoning": str(data.get("reasoning", "Provider judge scoring execution.")),
+            "_provider_meta": data.get("_provider_meta") if isinstance(data.get("_provider_meta"), dict) else {},
         }
 
     def evaluate_criteria_case(self, input_text: str, criteria: Any) -> Dict[str, Any]:
@@ -234,6 +358,50 @@ class ProviderJudgeService(JudgeService):
             "dimension_scores": dimension_scores,
             "overall_score": str(data.get("overall_score", "average")),
             "reasoning": str(data.get("reasoning", "Provider judge execution.")),
+            "_provider_meta": data.get("_provider_meta") if isinstance(data.get("_provider_meta"), dict) else {},
+        }
+
+    def score_criteria_case(
+        self,
+        input_text: str,
+        criteria: Any,
+        actual_response: Optional[str],
+    ) -> Dict[str, Any]:
+        if self.provider != "openai":
+            raise ProviderJudgeNotReadyError(
+                f"Provider judge mode is configured ({self.provider}) but only openai is currently implemented."
+            )
+        system_prompt = (
+            "You are an evaluation judge. Return strict JSON with keys: "
+            "criteria_results, dimension_scores, overall_score, reasoning. "
+            "criteria_results must be an array of {criterionId, score, evidence}. "
+            "Use score values in [good, average, not_good]. "
+            "Score the ACTUAL response, do not generate a new answer."
+        )
+        user_prompt = (
+            f"Input:\n{input_text}\n\n"
+            f"Criteria JSON:\n{json.dumps(criteria, ensure_ascii=True)}\n\n"
+            f"Actual response:\n{(actual_response or '').strip()}\n\n"
+            "Score only."
+        )
+        data = self._openai_json_judge(system_prompt, user_prompt)
+        criteria_results = data.get("criteria_results")
+        if not isinstance(criteria_results, list):
+            criteria_results = [{"criterionId": "criterion_1", "score": "average", "evidence": "Fallback."}]
+        dimension_scores = data.get("dimension_scores")
+        if not isinstance(dimension_scores, dict):
+            dimension_scores = {
+                str(x.get("criterionId", "criterion_1")): str(x.get("score", "average"))
+                for x in criteria_results
+                if isinstance(x, dict)
+            }
+
+        return {
+            "criteria_results": criteria_results,
+            "dimension_scores": dimension_scores,
+            "overall_score": str(data.get("overall_score", "average")),
+            "reasoning": str(data.get("reasoning", "Provider judge scoring execution.")),
+            "_provider_meta": data.get("_provider_meta") if isinstance(data.get("_provider_meta"), dict) else {},
         }
 
 

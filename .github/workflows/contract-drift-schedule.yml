@@ -1,0 +1,73 @@
+name: Contract Drift Schedule
+# Required GitHub repository secrets:
+# - SUPABASE_DB_URL
+# - SMOKE_ADMIN_API_KEY
+# - SMOKE_ORG_ID
+# - SMOKE_AGENT_ID
+# Optional:
+# - OPENAI_API_KEY (only required if provider judge mode is used in triggered runs)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-contract-drift-schedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      BASE_URL: http://127.0.0.1:8001
+      API_PREFIX: /api/v1
+      API_KEY: ${{ secrets.SMOKE_ADMIN_API_KEY }}
+      ORG_ID: ${{ secrets.SMOKE_ORG_ID }}
+      AGENT_ID: ${{ secrets.SMOKE_AGENT_ID }}
+      SCHEDULE_NAME: daily
+      WINDOW_MINUTES: '1440'
+      SUMMARY_WINDOW_DAYS: '30'
+      DRY_RUN: 'false'
+      FORCE: 'false'
+      FORCE_NOTIFY: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start API server
+        run: |
+          nohup uvicorn src.api.main:app --host 127.0.0.1 --port 8001 > uvicorn.log 2>&1 &
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8001/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to start"
+          cat uvicorn.log || true
+          exit 1
+
+      - name: Start eval worker
+        run: |
+          nohup python3 -m src.api.worker > worker.log 2>&1 &
+          sleep 1
+          pgrep -f "python3 -m src.api.worker" >/dev/null
+
+      - name: Run contract drift schedule cycle
+        run: ./scripts/run_contract_drift_schedule.sh
+
+      - name: Upload drift schedule logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-drift-schedule-${{ github.run_id }}
+          path: |
+            uvicorn.log
+            worker.log

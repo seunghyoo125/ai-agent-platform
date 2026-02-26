@@ -1,0 +1,11 @@
+{
+  "name": "ai-agent-platform-root",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "web:install": "npm --prefix ./web install",
+    "web:dev": "npm --prefix ./web run dev",
+    "web:build": "npm --prefix ./web run build",
+    "web:start": "npm --prefix ./web run start"
+  }
+}

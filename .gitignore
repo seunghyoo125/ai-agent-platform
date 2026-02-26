@@ -5,3 +5,10 @@ __pycache__/
 *.pyc
 output/
 .DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+.next/
+web/node_modules/
+web/.next/

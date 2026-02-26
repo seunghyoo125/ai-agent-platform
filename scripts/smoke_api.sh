@@ -7,6 +7,8 @@ set -euo pipefail
 #   ORG_ID          existing org uuid
 #   AGENT_ID        existing agent uuid
 #   GOLDEN_SET_ID   golden set uuid attached to AGENT_ID
+# Optional:
+#   API_PREFIX      /api (default) or /api/v1
 
 for v in BASE_URL API_KEY ORG_ID AGENT_ID GOLDEN_SET_ID; do
   if [[ -z "${!v:-}" ]]; then
@@ -15,13 +17,14 @@ for v in BASE_URL API_KEY ORG_ID AGENT_ID GOLDEN_SET_ID; do
   fi
 done
 
+API_PREFIX="${API_PREFIX:-/api}"
 auth_header="Authorization: Bearer ${API_KEY}"
 
 echo "[1/7] Health"
 curl -s "${BASE_URL}/health" | jq -e '.ok == true' >/dev/null
 
 echo "[2/7] Agent list"
-agents_resp="$(curl -s "${BASE_URL}/api/agents?org_id=${ORG_ID}" -H "${auth_header}")"
+agents_resp="$(curl -s "${BASE_URL}${API_PREFIX}/agents?org_id=${ORG_ID}" -H "${auth_header}")"
 if ! echo "${agents_resp}" | jq -e '.ok == true and (.data.count >= 1)' >/dev/null; then
   echo "Agent list check failed. Response:"
   echo "${agents_resp}" | jq .
@@ -43,7 +46,7 @@ run_payload="$(jq -n \
     design_context: {reason: "smoke test"}
   }')"
 
-run_resp="$(curl -s -X POST "${BASE_URL}/api/eval/runs" \
+run_resp="$(curl -s -X POST "${BASE_URL}${API_PREFIX}/eval/runs" \
   -H "${auth_header}" \
   -H "Content-Type: application/json" \
   -d "${run_payload}")"
@@ -52,16 +55,16 @@ echo "${run_resp}" | jq -e '.ok == true and .data.run_id != null' >/dev/null
 run_id="$(echo "${run_resp}" | jq -r '.data.run_id')"
 
 echo "[4/7] Execute run: ${run_id}"
-curl -s -X POST "${BASE_URL}/api/eval/runs/${run_id}/execute" -H "${auth_header}" | jq -e '.ok == true and .data.status == "completed"' >/dev/null
+curl -s -X POST "${BASE_URL}${API_PREFIX}/eval/runs/${run_id}/execute" -H "${auth_header}" | jq -e '.ok == true and .data.status == "completed"' >/dev/null
 
 echo "[5/7] Run summary"
-curl -s "${BASE_URL}/api/eval/runs/${run_id}/summary" -H "${auth_header}" | jq -e '.ok == true and (.data.total_results >= 1)' >/dev/null
+curl -s "${BASE_URL}${API_PREFIX}/eval/runs/${run_id}/summary" -H "${auth_header}" | jq -e '.ok == true and (.data.total_results >= 1)' >/dev/null
 
 echo "[6/7] Run results"
-curl -s "${BASE_URL}/api/eval/runs/${run_id}/results" -H "${auth_header}" | jq -e '.ok == true and (.data.total_count >= 1)' >/dev/null
+curl -s "${BASE_URL}${API_PREFIX}/eval/runs/${run_id}/results" -H "${auth_header}" | jq -e '.ok == true and (.data.total_count >= 1)' >/dev/null
 
 echo "[7/7] Validation envelope"
-curl -s -X POST "${BASE_URL}/api/agents" \
+curl -s -X POST "${BASE_URL}${API_PREFIX}/agents" \
   -H "${auth_header}" \
   -H "Content-Type: application/json" \
   -d '{}' | jq -e '.ok == false and .error.code == "VALIDATION_ERROR"' >/dev/null

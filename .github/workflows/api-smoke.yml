@@ -9,13 +9,15 @@ on:
 
 
 jobs:
-  smoke:
+  quality-gates:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       BASE_URL: http://127.0.0.1:8001
+      API_PREFIX: /api/v1
       API_KEY: ${{ secrets.SMOKE_API_KEY }}
+      ADMIN_API_KEY: ${{ secrets.SMOKE_ADMIN_API_KEY }}
       ORG_ID: ${{ secrets.SMOKE_ORG_ID }}
       AGENT_ID: ${{ secrets.SMOKE_AGENT_ID }}
       GOLDEN_SET_ID: ${{ secrets.SMOKE_GOLDEN_SET_ID }}
@@ -31,8 +33,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run unit tests
-        run: python3 -m pytest -q tests
+      - name: Regenerate SDK clients
+        run: PYTHONPATH=. ./scripts/generate_clients.py
+
+      - name: Check SDK drift
+        run: |
+          git diff --exit-code -- sdk/python/greenlight_client.py sdk/typescript/greenlightClient.ts
+
+      - name: Run full test suite
+        run: PYTHONPATH=. pytest -q
 
       - name: Start API server
         run: |
@@ -47,9 +56,211 @@ jobs:
           cat uvicorn.log || true
           exit 1
 
-      - name: Run smoke suite
-        run: ./scripts/smoke_api.sh
+      - name: Start eval worker
+        run: |
+          nohup python3 -m src.api.worker > worker.log 2>&1 &
+          sleep 1
+          pgrep -f "python3 -m src.api.worker" >/dev/null
+
+      - name: Run queue-aware quality gate
+        run: ./scripts/ci_quality_gate.sh
+
+      - name: Export OpenAPI schema
+        run: curl -fsS http://127.0.0.1:8001/openapi.json -o openapi.json
+
+      - name: Validate OpenAPI queue/admin contracts
+        run: |
+          jq -e '
+            .paths["/api/system/queue/jobs/{job_id}/retry"].post.parameters
+            | any(.in=="header" and (.name|ascii_downcase)=="idempotency-key" and .required==true)
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/jobs/{job_id}/cancel"].post.parameters
+            | any(.in=="header" and (.name|ascii_downcase)=="idempotency-key" and .required==true)
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/jobs/failed/replay"].post.parameters
+            | any(.in=="header" and (.name|ascii_downcase)=="idempotency-key" and .required==true)
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/jobs/reap-stale"].post.parameters
+            | any(.in=="header" and (.name|ascii_downcase)=="idempotency-key" and .required==true)
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/jobs/prune"].post.parameters
+            | any(.in=="header" and (.name|ascii_downcase)=="idempotency-key" and .required==true)
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/run"].post.parameters
+            | any(.in=="header" and (.name|ascii_downcase)=="idempotency-key" and .required==true)
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/reap-stale-runs"].post.parameters
+            | any(.in=="header" and (.name|ascii_downcase)=="idempotency-key" and .required==true)
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/schedule-summary/notify"].post.parameters
+            | any(.in=="header" and (.name|ascii_downcase)=="idempotency-key" and .required==true)
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/jobs/failed/replay"].post.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueJobsReplayResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/jobs/reap-stale"].post.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueJobsReapStaleResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/jobs/prune"].post.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueJobsPruneResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance-policy"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenancePolicyResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance-policy"].post.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenancePolicyResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/run"].post.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenanceRunResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/reap-stale-runs"].post.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenanceReapStaleResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/schedule-trigger"].post.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenanceScheduleTriggerResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/schedule-summary"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenanceScheduleSummaryResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/schedule-summary/notify"].post.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenanceScheduleNotifyResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/schedule-alert-delivery"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenanceScheduleAlertDeliveryResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/runs"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenanceRunListResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/runs/{run_id}"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenanceRunDetailResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/system/queue/maintenance/metrics"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/QueueMaintenanceMetricsResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/eval/runs"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/EvalRunListResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/score-trend"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/AgentScoreTrendResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/health"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/AgentHealthResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/orgs/{org_id}/portfolio-health"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/PortfolioHealthResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/eval/runs/{run_id}/artifacts"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/EvalRunArtifactsResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/eval/runs/{run_id}/review-queue"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/EvalRunReviewQueueResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/eval/runs/{run_id}/results/{result_id}/review"].patch.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/EvalRunResultReviewResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/calibration-gate-status"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/CalibrationGateStatusResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/golden-sets/{golden_set_id}/quality-gate-status"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/GoldenSetQualityGateStatusResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/gate-definitions"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/GateDefinitionListResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/gate-definitions"].post.responses["201"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/GateDefinitionCreateResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/gate-bindings"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/AgentGateBindingListResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/gate-bindings"].post.responses["201"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/AgentGateBindingUpsertResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/evaluator-definitions"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/EvaluatorDefinitionListResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/evaluator-definitions"].post.responses["201"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/EvaluatorDefinitionCreateResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/evaluator-bindings"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/AgentEvaluatorBindingListResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/evaluator-bindings"].post.responses["201"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/AgentEvaluatorBindingUpsertResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/run-type-definitions"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/RunTypeDefinitionListResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/run-type-definitions"].post.responses["201"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/RunTypeDefinitionCreateResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/run-type-bindings"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/AgentRunTypeBindingListResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/run-type-bindings"].post.responses["201"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/AgentRunTypeBindingUpsertResponse"
+          ' openapi.json >/dev/null
+          jq -e '
+            .paths["/api/agents/{agent_id}/contract-status"].get.responses["200"].content["application/json"].schema["$ref"]
+            == "#/components/schemas/AgentContractStatusResponse"
+          ' openapi.json >/dev/null
+
+      - name: Upload quality artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-artifacts-${{ github.run_id }}
+          path: |
+            openapi.json
+            sdk/python/greenlight_client.py
+            sdk/typescript/greenlightClient.ts
+            uvicorn.log
+            worker.log
 
       - name: Dump API logs on failure
         if: failure()
-        run: cat uvicorn.log || true
+        run: |
+          cat uvicorn.log || true
+          cat worker.log || true

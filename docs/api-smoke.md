@@ -14,10 +14,15 @@ Required env vars:
 - `AGENT_ID`
 - `GOLDEN_SET_ID`
 
+Optional env vars:
+
+- `API_PREFIX` (`/api` default, or `/api/v1`)
+
 Run:
 
 ```bash
 BASE_URL=http://127.0.0.1:8001 \
+API_PREFIX=/api/v1 \
 API_KEY=sk_live_xxx \
 ORG_ID=23cdb862-a12f-4b6c-84ee-5cb648f9b5bb \
 AGENT_ID=e3660b25-47cf-47f3-ab53-c080fb7ffdcc \
